@@ -15,7 +15,9 @@
  */
 
 #include <algorithm>
+#include <optional>
 
+#include <android-base/properties.h>
 #include <common/FlagManager.h>
 #include "Client.h"
 #include "Layer.h"
@@ -24,6 +26,26 @@
 #include <SkSurface.h>
 
 namespace android {
+
+namespace {
+
+constexpr char kOplusRefreshRateProperty[] = "vendor.display.oplus_refresh_rate";
+constexpr char kShowOplusMinFpsProperty[] = "debug.sf.show_oplus_min_fps_overlay";
+
+std::optional<int> getOplusMinFpsForOverlay() {
+    if (!base::GetBoolProperty(kShowOplusMinFpsProperty, false)) {
+        return std::nullopt;
+    }
+
+    const int refreshRate = base::GetIntProperty(kOplusRefreshRateProperty, 0);
+    if (refreshRate <= 0) {
+        return std::nullopt;
+    }
+
+    return refreshRate;
+}
+
+} // namespace
 
 auto RefreshRateOverlay::draw(int refreshRate, int renderFps, bool idle, SkColor color,
                               ui::Transform::RotationFlags rotation, ftl::Flags<Features> features)
@@ -204,6 +226,10 @@ auto RefreshRateOverlay::getOrCreateBuffers(Fps refreshRate, Fps renderFps, bool
     // avoid caching different render rates if RenderRate is anyway not visible
     if (!mFeatures.test(Features::RenderRate)) {
         renderFps = 0_Hz;
+    }
+
+    if (const auto oplusMinFps = getOplusMinFpsForOverlay()) {
+        refreshRate = Fps::fromValue(*oplusMinFps);
     }
 
     const auto transformHint =
