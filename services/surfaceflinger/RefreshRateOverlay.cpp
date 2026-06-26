@@ -30,13 +30,8 @@ namespace android {
 namespace {
 
 constexpr char kOplusRefreshRateProperty[] = "vendor.display.oplus_refresh_rate";
-constexpr char kShowOplusMinFpsProperty[] = "debug.sf.show_oplus_min_fps_overlay";
 
 std::optional<int> getOplusMinFpsForOverlay() {
-    if (!base::GetBoolProperty(kShowOplusMinFpsProperty, false)) {
-        return std::nullopt;
-    }
-
     const int refreshRate = base::GetIntProperty(kOplusRefreshRateProperty, 0);
     if (refreshRate <= 0) {
         return std::nullopt;
