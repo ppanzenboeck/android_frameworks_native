@@ -26,11 +26,15 @@
 #include "SurfaceFlinger.h"
 
 #include <aidl/android/hardware/power/Boost.h>
+#include <aidl/vendor/oplus/hardware/displaypanelfeature/IDisplayPanelFeature.h>
+#include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <android/binder_libbinder.h>
+#include <android/binder_manager.h>
 #include <android/configuration.h>
 #include <android/gui/IDisplayEventConnection.h>
 #include <android/gui/StaticDisplayInfo.h>
@@ -238,6 +242,7 @@ using scheduler::VSyncTracker;
 using ui::Dataspace;
 using ui::DisplayPrimaries;
 using ui::RenderIntent;
+using aidl::vendor::oplus::hardware::displaypanelfeature::IDisplayPanelFeature;
 
 namespace hal = android::hardware::graphics::composer::hal;
 
@@ -246,9 +251,133 @@ namespace {
 static constexpr int FOUR_K_WIDTH = 3840;
 static constexpr int FOUR_K_HEIGHT = 2160;
 static constexpr char kOplusRefreshRateProperty[] = "vendor.display.oplus_refresh_rate";
+static constexpr char kOplusDisplayPanelFeatureService[] =
+        "vendor.oplus.hardware.displaypanelfeature.IDisplayPanelFeature/default";
+static constexpr char kOplusMinFpsPath[] = "/sys/kernel/oplus_display/min_fps";
+static constexpr int kOplusFeatureLongruiAod = 217;
+static constexpr int kOplusFeatureAdfr2MinFpsEnable = 232;
+static constexpr int kOplusLongruiAodOff = 0;
+static constexpr int kOplusLongruiAodOn = 14;
+static constexpr uint32_t kOplusTransactionSetQsyncMode = 23003;
+static constexpr uint32_t kOplusTransactionSetQsyncMinFps = 23004;
+static constexpr uint32_t kOplusTransactionGetModeType = 23005;
+static constexpr uint32_t kOplusTransactionAdfrMinFps = 23009;
+static constexpr uint32_t kOplusTransactionRefreshRateInfo = 22032;
+
+enum class OplusDisplayModeType : int32_t {
+    SA = 0,
+    OA = 2,
+};
 
 bool shouldUseOplusMinFpsOverlay() {
     return base::GetIntProperty(kOplusRefreshRateProperty, 0) > 0;
+}
+
+std::shared_ptr<IDisplayPanelFeature> getOplusDisplayPanelFeature() {
+    static std::shared_ptr<IDisplayPanelFeature> panelFeature;
+    static bool loggedUnavailable = false;
+
+    if (panelFeature != nullptr) {
+        return panelFeature;
+    }
+
+    sp<IBinder> platformBinder =
+            defaultServiceManager()->checkService(String16(kOplusDisplayPanelFeatureService));
+    if (platformBinder == nullptr) {
+        if (!loggedUnavailable) {
+            ALOGW("Oplus display panel feature service unavailable");
+            loggedUnavailable = true;
+        }
+        return nullptr;
+    }
+
+    ndk::SpAIBinder binder(AIBinder_fromPlatformBinder(platformBinder));
+    panelFeature = IDisplayPanelFeature::fromBinder(binder);
+    if (panelFeature == nullptr && !loggedUnavailable) {
+        ALOGW("Failed to bind Oplus display panel feature service");
+        loggedUnavailable = true;
+    }
+    return panelFeature;
+}
+
+void notifyOplusAodState(bool enabled) {
+    auto panelFeature = getOplusDisplayPanelFeature();
+    if (panelFeature == nullptr) {
+        return;
+    }
+
+    std::vector<int> values = {enabled ? kOplusLongruiAodOn : kOplusLongruiAodOff};
+    int status = 0;
+    const auto ret =
+            panelFeature->setDisplayPanelFeatureValue(kOplusFeatureLongruiAod, values, &status);
+    if (!ret.isOk() || status != 0) {
+        ALOGW("Failed to notify Oplus AOD state %d, binder=%s status=%d", enabled,
+              ret.getDescription().c_str(), status);
+        return;
+    }
+
+    ALOGD("Notified Oplus AOD state %d", enabled);
+}
+
+status_t setOplusQsyncMinFps(int fps) {
+    auto panelFeature = getOplusDisplayPanelFeature();
+    if (panelFeature == nullptr) {
+        return NAME_NOT_FOUND;
+    }
+
+    std::vector<int> values = {0, fps};
+    int status = 0;
+    const auto ret = panelFeature->setDisplayPanelFeatureValue(kOplusFeatureAdfr2MinFpsEnable,
+                                                               values, &status);
+    if (!ret.isOk() || status != 0) {
+        ALOGW("Failed to set Oplus QSync minfps %d, binder=%s status=%d", fps,
+              ret.getDescription().c_str(), status);
+        return UNKNOWN_ERROR;
+    }
+
+    ALOGD("Set Oplus QSync minfps %d", fps);
+    return NO_ERROR;
+}
+
+status_t setOplusQsyncMode(bool enabled) {
+    auto panelFeature = getOplusDisplayPanelFeature();
+    if (panelFeature == nullptr) {
+        return NAME_NOT_FOUND;
+    }
+
+    std::vector<int> values = {0, enabled ? 1 : 0};
+    int status = 0;
+    const auto ret = panelFeature->setDisplayPanelFeatureValue(kOplusFeatureAdfr2MinFpsEnable,
+                                                               values, &status);
+    if (!ret.isOk() || status != 0) {
+        ALOGW("Failed to set Oplus QSync mode %d, binder=%s status=%d", enabled,
+              ret.getDescription().c_str(), status);
+        return UNKNOWN_ERROR;
+    }
+
+    ALOGD("Set Oplus QSync mode %d", enabled);
+    return NO_ERROR;
+}
+
+int32_t getOplusDisplayModeType(const DisplayModePtr& mode) {
+    // Stock Oplus VRR queries SF for SA/SM/OA/OM classification. We only expose
+    // adaptive-vs-standard here: modes with VRR config are Oplus adaptive modes.
+    return static_cast<int32_t>(mode->getVrrConfig().has_value() ? OplusDisplayModeType::OA
+                                                                  : OplusDisplayModeType::SA);
+}
+
+std::string getOplusRefreshRateInfo() {
+    std::string minFps;
+    if (!android::base::ReadFileToString(kOplusMinFpsPath, &minFps)) {
+        minFps = "unknown";
+    } else {
+        minFps = android::base::Trim(minFps);
+    }
+
+    const std::string measured =
+            base::GetProperty(kOplusRefreshRateProperty, "unknown");
+    return base::StringPrintf("Oplus Refresh Rate Info: measured=%s minfps=%s",
+                              measured.c_str(), minFps.c_str());
 }
 
 // TODO(b/141333600): Consolidate with DisplayMode::Builder::getDefaultDensity.
@@ -6524,6 +6653,14 @@ SurfaceFlinger::setPhysicalDisplayPowerModeAsync(const sp<DisplayDevice>& displa
         onNewPacesetterDisplay();
     }
 
+    const bool wasDozing = currentMode == hal::PowerMode::DOZE ||
+            currentMode == hal::PowerMode::DOZE_SUSPEND;
+    const bool isDozing = mode == hal::PowerMode::DOZE ||
+            mode == hal::PowerMode::DOZE_SUSPEND;
+    if (displayId == mFrontInternalDisplayId && wasDozing != isDozing) {
+        notifyOplusAodState(isDozing);
+    }
+
     const auto activeMode = display->refreshRateSelector().getActiveMode().modePtr;
     if (currentMode == hal::PowerMode::OFF) {
         // Turn on the display
@@ -7541,6 +7678,11 @@ status_t SurfaceFlinger::CheckTransactCodeCredentials(uint32_t code) {
         code == IBinder::SYSPROPS_TRANSACTION) {
         return OK;
     }
+    if (code == kOplusTransactionSetQsyncMode || code == kOplusTransactionSetQsyncMinFps ||
+        code == kOplusTransactionGetModeType || code == kOplusTransactionAdfrMinFps ||
+        code == kOplusTransactionRefreshRateInfo) {
+        return OK;
+    }
     // Numbers from 1000 to 1047 are currently used for backdoors. The code
     // in onTransact verifies that the user is root, and has access to use SF.
     if (code >= 1000 && code <= 1047) {
@@ -7574,6 +7716,30 @@ status_t SurfaceFlinger::onTransact(uint32_t code, const Parcel& data, Parcel* r
         SFTRACE_FORMAT("onTransact (backdoor) code %" PRId32, code);
         int n;
         switch (code) {
+            case kOplusTransactionSetQsyncMode:
+                return setOplusQsyncMode(data.readInt32() != 0);
+            case kOplusTransactionSetQsyncMinFps:
+                return setOplusQsyncMinFps(data.readInt32());
+            case kOplusTransactionGetModeType: {
+                const DisplayModeId modeId{static_cast<ui::DisplayModeId>(data.readInt32())};
+                Mutex::Autolock lock(mStateLock);
+                for (const auto& [displayId, physical] : mPhysicalDisplays) {
+                    if (const auto modeOpt = physical.snapshot().displayModes().get(modeId)) {
+                        if (reply != nullptr) {
+                            reply->writeInt32(getOplusDisplayModeType(*modeOpt));
+                        }
+                        return NO_ERROR;
+                    }
+                }
+                return NAME_NOT_FOUND;
+            }
+            case kOplusTransactionAdfrMinFps:
+                return setOplusQsyncMode(data.readInt32() != 0);
+            case kOplusTransactionRefreshRateInfo:
+                if (reply != nullptr) {
+                    reply->writeString16(String16(getOplusRefreshRateInfo().c_str()));
+                }
+                return NO_ERROR;
             case 1000: // Unused.
             case 1001:
                 return NAME_NOT_FOUND;

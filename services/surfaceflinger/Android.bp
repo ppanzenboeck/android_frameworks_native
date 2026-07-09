@@ -173,6 +173,7 @@ cc_defaults {
         "libsync",
         "libui",
         "libutils",
+        "vendor.oplus.hardware.displaypanelfeature-V1-ndk",
     ],
     static_libs: [
         "iinputflinger_aidl_lib_static",
