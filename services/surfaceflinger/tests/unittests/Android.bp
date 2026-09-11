@@ -156,6 +156,7 @@ cc_defaults {
         "libtracing_perfetto",
         "libui",
         "libutils",
+        "vendor.oplus.hardware.displaypanelfeature-V1-ndk",
     ],
     header_libs: [
         "android.hardware.graphics.composer3-command-buffer-V5",
